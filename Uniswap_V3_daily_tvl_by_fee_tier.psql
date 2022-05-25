@@ -1,0 +1,86 @@
+-- https://dune.com/queries/559946
+
+WITH uni_pool_fee_tier AS (
+    SELECT DISTINCT
+        pool as lp_pool,
+        CONCAT(TRUNC(fee/1e6 * 100, 2), '%') AS fee_tier -- Converting fee tier to string (i.e., 3000 -> 0.3%)
+    FROM uniswap_v3."Factory_evt_PoolCreated"
+),
+
+uni_tokens AS (
+    SELECT DISTINCT token
+    FROM (
+          SELECT token0 as token 
+          FROM uniswap_v3."Factory_evt_PoolCreated"
+          UNION
+          SELECT token1 as token 
+          FROM uniswap_v3."Factory_evt_PoolCreated") tokens
+),
+
+eod_price AS ( -- Get end-of-day price so we can use it to calculate TVL
+        SELECT DISTINCT ON (1, 4)
+            contract_address, 
+            symbol, 
+            decimals,
+            DATE_TRUNC('day', minute) as day,
+            minute,
+            price
+        FROM prices."usd" p
+        WHERE minute >= '05-05-2021 00:00' -- date Uni v3 launched
+            AND p.contract_address IN (SELECT token FROM uni_tokens)
+        ORDER BY 1, 4, 5 DESC
+),
+
+lp_outs_ins AS ( -- Get transfers to/from the lp pool
+        SELECT
+            DATE_TRUNC('day', txf.evt_block_time) as day,
+            lp_pool,
+            fee_tier,
+            txf.contract_address AS token,
+            SUM(-txf.value) AS token_amount -- decrease
+        FROM uni_pool_fee_tier lp
+        LEFT JOIN erc20."ERC20_evt_Transfer" txf
+            ON lp_pool = txf."from" --transactions where the LP is sending tokens
+        GROUP BY 1, 2, 3, 4
+        UNION
+        SELECT
+            DATE_TRUNC('day', txf.evt_block_time) as day,
+            lp_pool,
+            fee_tier,
+            txf.contract_address AS token,
+            SUM(txf.value) AS token_amount -- increase
+        FROM uni_pool_fee_tier lp
+        LEFT JOIN erc20."ERC20_evt_Transfer" txf
+            ON lp_pool = txf."to" --transactions where the LP is recieving tokens
+        GROUP BY 1, 2, 3, 4
+),
+
+lp_daily_net_cumsum AS ( 
+    SELECT
+        day,
+        lp_pool,
+        fee_tier,
+        symbol,
+        SUM(token_amount/10^decimals) as net_amount,
+        sum(sum(token_amount/10^decimals)) over (
+            partition by lp_pool, fee_tier, symbol
+            order by day) as cumulative_balance
+    FROM lp_outs_ins lp
+        INNER JOIN erc20.tokens t -- only include tokens in erc20.tokens
+            ON lp.token = t.contract_address
+    GROUP BY 1, 2, 3, 4
+    ORDER BY 2, 3, 4, 1
+)
+
+SELECT
+    a.day,
+    -- lp_pool,
+    fee_tier,
+    ROUND(SUM(net_amount * price)::numeric, 2) AS net_usd,                  --combine usd of tokens by pool & day
+    ROUND(SUM(cumulative_balance * price)::numeric, 2) AS tvl_usd --cumulative usd of tokens by pool & day
+FROM lp_daily_net_cumsum a
+    LEFT JOIN eod_price p
+        ON a.symbol = p.symbol
+            AND a.day = p.day
+GROUP BY 1, 2
+ORDER BY 2, 1
