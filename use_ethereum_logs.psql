@@ -1,0 +1,14 @@
+select 
+contract_address,
+block_time,
+data,
+length(data) as data_length,
+-- substring("data" from 1 for 32) as token_addr,
+('x' || right(substring("data" from 1 for 32)::text, 16))::bit(64)::bigint as old_factor,
+-- substring("data" from 33 for 32) as new_factor
+('x' || right(substring("data" from 33 for 32)::text, 16))::bit(64)::bigint as new_factor
+from ethereum."logs"
+where contract_address = '\x4dCf7407AE5C07f8681e1659f626E114A7667339' -- CloseFactor
+ and --topic1 = '\x70483e6592cd5182d45ac970e05bc62cdcc90e9d8ef2c2dbe686cf383bcd7fc5' -- CollateralFactor
+ topic1 = '\x3b9670cf975d26958e754b57098eaa2ac914d8d2a31b83257997b9f346110fd9'
+ order by block_time;
