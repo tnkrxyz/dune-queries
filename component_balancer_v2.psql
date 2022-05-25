@@ -1,0 +1,694 @@
+-- https://dune.com/queries/699107
+with weighted_pools as (
+    select pool from (
+        select pool from
+            balancer_v2."WeightedPoolFactory_evt_PoolCreated"
+        union all
+        select pool from
+            balancer_v2."WeightedPool2TokensFactory_evt_PoolCreated"
+    ) pools
+    where pool = '{{Weighted Pool address}}'
+),
+
+weighted_pools_w_id as (
+    select 
+        "poolAddress" as "Contract_address", 
+        "poolId", 
+        specialization
+    from balancer_v2."Vault_evt_PoolRegistered" v
+    inner join weighted_pools w
+        on v."poolAddress" = w.pool
+),
+
+pool_tokens as (
+    select 
+        "Contract_address", 
+        v."poolId", 
+        unnest(tokens) as "Token_address" 
+    from balancer_v2."Vault_evt_TokensRegistered" v
+    inner join weighted_pools_w_id p
+        on v."poolId" = p."poolId"
+),
+
+pool_tokens_w_symbol as (
+    select 
+        "Contract_address", 
+        "poolId", 
+        "Token_address", 
+        case when symbol is not null then symbol else "Token_address"::text end as symbol, 
+        case when decimals is not null then decimals else {{Default Token decimals}} end as decimals
+    from pool_tokens p
+    left join erc20.tokens t
+        on p."Token_address" = t.contract_address
+),
+
+pool_symbols as (
+    select "Contract_address", 
+            "poolId", 
+            STRING_AGG(symbol, ':') as "Token_symbols",
+            array_agg("Token_address") as "Token_addresses"
+    from pool_tokens_w_symbol
+    group by "Contract_address", 
+            "poolId"
+),
+
+-- weights
+-- normalized weights won't change after pool creation
+_token_weights1 as (
+    select distinct
+        s."Contract_address",
+        -- we unnest token address along with output to ensure the correct order
+        unnest(s."Token_addresses") as "Token_address",
+        unnest(w.output_0)/10^18 as token_weight
+    from pool_symbols s
+    left join balancer_v2."WeightedPool_call_getNormalizedWeights" w
+        on s."Contract_address" = w."contract_address"
+    where w.call_success = true
+    order by "Contract_address", "Token_address"
+),
+
+_token_weights2 as (
+    select 
+        "Contract_address",
+        array_agg("Token_address") as "Token_addresses",
+        array_agg(token_weight) as token_weights
+    from _token_weights1
+    group by "Contract_address"
+),
+
+pool_symbols_weights as (
+    select distinct 
+        s.*,
+        w.token_weights
+    from pool_symbols s 
+    left join _token_weights2 w
+        on s."Contract_address" = w."Contract_address"
+),
+
+date_range as (
+ select min(evt_block_time)::date as start_date,
+ now()::date as end_date
+ from balancer_v2."WeightedPool_evt_Transfer"
+ where contract_address = '{{Weighted Pool address}}'
+),
+
+date_seq as (
+    select "Day"
+    from date_range
+    cross join generate_series(start_date,
+                               end_date,
+                               interval  '1 day') as "Day"
+),                  
+
+pool_date_seq as (
+    select
+        d."Day", 
+        p.*
+    from pool_symbols_weights p
+    cross join date_seq d
+),
+
+-- # swaps
+_swaps as (
+    select 
+        p."Contract_address",
+        date_trunc('day', "evt_block_time") as "Day",
+        count(*) as "swaps"
+    from weighted_pools_w_id p
+    inner join balancer_v2."Vault_evt_Swap" s
+        on p."poolId" = s."poolId"
+    group by 1, 2
+),
+
+-- swap amount
+_swap_amount as (
+select
+    p."Contract_address",
+    d."Day",
+    s_in."tokenIn" as "Token_address",
+    s_in."amountIn" as amount
+    --s_in."tokenIn",
+    --s_out."tokenOut"
+from weighted_pools_w_id p
+    cross join date_seq d
+    left join balancer_v2."Vault_evt_Swap" s_in
+        on p."poolId" = s_in."poolId"
+        and d."Day" = date_trunc('day', s_in."evt_block_time")
+union all
+select 
+    p."Contract_address",
+    d."Day",
+    s_out."tokenOut" as "Token_address",
+    -s_out."amountOut" as amount
+from weighted_pools_w_id p
+    cross join date_seq d
+    left join balancer_v2."Vault_evt_Swap" s_out
+        on p."poolId" = s_out."poolId"
+        and d."Day" = date_trunc('day', s_out."evt_block_time")
+),
+
+/*
+select * from _swap_amount order by "Day";
+
+select * from
+balancer_v2."Vault_evt_Swap"
+where '\xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2' in ("tokenIn", "tokenOut")
+and "poolId" = '\x87165b659ba7746907a48763063efa3b323c2b0700020000000000000000002d'
+order by evt_block_time
+*/
+
+-- swap volume
+-- currently we calculate the net token amount as volume
+-- an alternative is to use cumulative amount as volume
+_swap_volume1 as (
+    select 
+        s."Contract_address",
+        s."Day",
+        s."Token_address",
+        sum(coalesce(amount, 0)/10^t.decimals) as volume
+    from _swap_amount s
+        left join pool_tokens_w_symbol t
+            on s."Contract_address" = t."Contract_address"
+            and s."Token_address" = t."Token_address"
+    group by 1, 2, 3
+    order by 1, 2, 3
+),
+
+_swap_volume2 as (
+select 
+    "Contract_address",
+    "Day",
+    array_agg("Token_address") as "Token_addresses",
+    array_agg(volume) as "Token_Volumes"
+from _swap_volume1
+group by "Contract_address",
+    "Day"
+),
+
+swap_volume as (
+    select p.*, sv."Token_Volumes"
+    from pool_date_seq p
+    left join _swap_volume2 sv
+        on p."Contract_address" = sv."Contract_address"
+        and p."Day" = sv."Day"
+),
+
+-- mint & burn of LP tokens
+_lp_mint as (
+    select
+    date_trunc('day', "evt_block_time") as "Day",
+    "evt_block_time",
+    "evt_block_number",
+    contract_address, -- pool_address
+    "value" as amount
+    from balancer_v2."WeightedPool_evt_Transfer"
+    where "from" = '\x0000000000000000000000000000000000000000'
+),
+
+_lp_burn as (
+    select
+    date_trunc('day', "evt_block_time") as "Day",
+    "evt_block_time",
+    "evt_block_number",
+    contract_address, -- pool_address
+    -"value" as amount
+    from balancer_v2."WeightedPool_evt_Transfer"
+    where "to" = '\x0000000000000000000000000000000000000000'
+),
+
+-- # swaps, mints, burns
+swaps_mints_burns as (
+select 
+    p.*,
+    case when s.swaps is null then 0 else s.swaps end as "Number_swaps",
+    case when m.mints is null then 0 else m.mints end as "Number_mints",
+    case when b.burns is null then 0 else b.burns end as "Number_burns"
+from swap_volume p
+left join _swaps s
+    on p."Day" = s."Day" 
+        and p."Contract_address" = s."Contract_address"
+left join (
+    select "Day", contract_address,
+    count(*) as mints 
+    from _lp_mint 
+    group by "Day", "contract_address") m
+    on p."Day" = m."Day" 
+        and p."Contract_address" = m.contract_address
+left join (
+    select "Day", contract_address,
+    count(*) as burns 
+    from _lp_burn 
+    group by "Day", contract_address) b
+on p."Day" = b."Day"
+    and p."Contract_address" = b.contract_address
+),
+
+-- lp token delta
+_lp_token_supply1 as (
+    select 
+        mb.contract_address as "Contract_address",
+        "Day",
+        sum(amount) as delta
+    from (
+        select  * 
+        from _lp_mint 
+        union all
+        select *
+        from _lp_burn) mb
+    where mb.contract_address = '{{Weighted Pool address}}'
+    group by mb.contract_address, "Day"
+),
+
+-- lp token may not exist in erc20.tokens
+-- if so, use {{Default Token decimals}} parameter for decimals
+_lp_token_decimals as (
+    select p."Contract_address",
+    case when t.decimals is null then {{Default Token decimals}} else decimals end as decimals
+    from (
+        select
+            '{{Weighted Pool address}}'::bytea as "Contract_address") p
+    left join    
+        erc20.tokens t on t.contract_address = p."Contract_address"
+),
+
+_lp_token_supply2 as (
+    select 
+        s."Contract_address",
+        s."Day",
+        (sum(delta) over (partition by s."Contract_address" order by "Day"))/10^d.decimals as "Total_LP_token_supply"
+    from _lp_token_supply1 s
+    left join _lp_token_decimals d
+        on s."Contract_address" = d."Contract_address"
+    order by s."Contract_address",
+        s."Day" DESC
+),
+
+_lp_token_supply3 as (
+      select 
+      d."Contract_address", 
+      d."Day", 
+      --"Total_LP_token_supply",
+      case when s."Total_LP_token_supply" is not null then s."Total_LP_token_supply" else 0 end as "Total_LP_token_supply",
+      sum(case when "Total_LP_token_supply" is not null then 1 else 0 end) over (partition by d."Contract_address" order by d."Day") as grp_supply
+      from  swaps_mints_burns d
+        left join _lp_token_supply2 s
+            on d."Contract_address" = s."Contract_address"
+                and d."Day" = s."Day"
+        
+),
+
+-- down fill token supply in case there are days when no mint/burn evt was emitted
+_lp_token_supply4 as (
+select
+    p."Contract_address",
+    p."Day",
+    grp_supply,
+    "Total_LP_token_supply" as "origTotal_LP_token_supply", 
+    first_value("Total_LP_token_supply") over (partition by grp_supply) as "Total_LP_token_supply"
+from _lp_token_supply3 p
+),
+
+lp_token_supply as (
+    select
+        mb.*,
+        s."Total_LP_token_supply"
+    from swaps_mints_burns mb
+    left join _lp_token_supply4 s
+        on mb."Contract_address" = s."Contract_address"
+            and mb."Day" = s."Day"
+),
+
+-- latest block/timestamp for the day
+_latest_ts_block1 as (
+    select distinct on (1, 2)
+        "poolId",
+        date_trunc('day', "evt_block_time") as "Day",
+        "evt_block_time" as "Latest_block_timestamp",
+        "evt_block_number" as "Latest_block",
+        -- evt_tx_hash,
+        evt_index
+    from balancer_v2."Vault_evt_PoolBalanceChanged"
+    order by 1, 2, 5 DESC
+),
+   
+_latest_ts_block2 as (
+    select
+        p."Contract_address",
+        t."Day",
+        t."Latest_block_timestamp",
+        t."Latest_block"
+    from weighted_pools_w_id p
+    left join _latest_ts_block1 t
+    on p."poolId" = t."poolId"
+),
+
+latest_ts_block as (
+    select 
+        s.*,
+        tb."Latest_block_timestamp",
+        tb."Latest_block"
+    from lp_token_supply s
+    left join _latest_ts_block2 tb
+        on s."Contract_address" = tb."Contract_address"
+            and s."Day" = tb."Day"
+),
+
+-- reserves
+_pool_reserve1 as (
+select
+    id."Contract_address",
+    date_trunc('day', "evt_block_time") as "Day",
+    --"evt_block_time",
+    --"evt_block_number" as block_number,
+    --id."poolId",
+    unnest("tokens") as "Token_address",
+    unnest(deltas) as delta,
+    unnest("protocolFeeAmounts") as "protocolFees"
+from balancer_v2."Vault_evt_PoolBalanceChanged" p
+inner join weighted_pools_w_id id
+    on p."poolId" = id."poolId"
+order by "Contract_address", "Day", "Token_address"
+),
+
+_pool_reserve2 as (
+select 
+    t."Contract_address",
+    d."Day",
+    t."Token_address",
+    --sum(case when delta is not null then delta/10^s.decimals else 0 end) as daily_delta,
+    --sum(case when "protocolFees" is not null then "protocolFees"/10^s.decimals else 0 end) as "daily_protocolFees",
+    --sum(case when delta is not null then delta/10^t.decimals else 0 end) - sum(case when "protocolFees" is not null then "protocolFees"/10^t.decimals else 0 end) as delta
+    sum((coalesce(delta, 0) - coalesce("protocolFees", 0))/10^t.decimals) as delta
+from pool_tokens_w_symbol t
+    cross join date_seq d
+    left join _pool_reserve1 p
+        on d."Day" = p."Day"
+            and p."Contract_address" = t."Contract_address"
+            and p."Token_address" = t."Token_address"
+group by 1, 2, 3
+),
+
+_pool_reserve2_1 as (
+select
+    "Contract_address",
+    "Day",
+    "Token_address",
+    sum(delta) as delta
+from (
+    select * from _pool_reserve2
+    union all
+    select "Contract_address",
+           "Day",
+           "Token_address",
+            volume as delta 
+    from _swap_volume1) d
+group by 1, 2, 3
+),
+
+_pool_reserve3 as (
+select
+    "Contract_address",
+    "Day",
+    "Token_address",
+    sum(delta) over (partition by "Contract_address", "Token_address" order by "Day") as "Latest_reserve"
+from _pool_reserve2_1 p
+order by 1, 2, 3
+),
+
+_pool_reserve4 as (
+select 
+    "Contract_address",
+    "Day",
+    array_agg("Token_address") as "Token_addresses",
+    array_agg("Latest_reserve") as "Latest_reserves"
+from _pool_reserve3
+group by "Contract_address", "Day"
+),
+
+pool_reserve as (
+    select l.*,
+        r."Latest_reserves"
+    from latest_ts_block l
+    left join _pool_reserve4 r
+        on l."Contract_address" = r."Contract_address"
+        and l."Day" = r."Day"
+),
+
+-- invariant_k
+-- we have to do the calculation using the information available
+-- since balancer_v2."WeightedPool_call_getInvariant" is basically
+-- empty and other related tables are empty
+-- the formula from _calculateInvariant in WeightedMath.sol
+_invariant1 as (
+    select
+        w."Contract_address",
+        unnest("Token_addresses") as "Token_address",
+        unnest("token_weights") as "Token_weight"
+    from pool_symbols_weights w
+    order by "Contract_address", "Token_address"
+),
+
+_invariant2 as (
+select
+    r."Contract_address",
+    r."Day",
+    r."Token_address",
+    r."Latest_reserve",
+    "Token_weight",
+    power(r."Latest_reserve", "Token_weight") as bi_pow_wi
+from _pool_reserve3 r
+left join _invariant1 w
+    on r."Contract_address" = w."Contract_address"
+        and r."Token_address" = w."Token_address"
+),
+
+_invariant3 as (
+select
+    x."Contract_address",
+    x."Day",
+    -- since psql doest have a product function, use exp(sum(ln(x)))
+    exp(sum(ln(case when bi_pow_wi = 0 then 1 else bi_pow_wi end))) as "Invariant_k"
+from _invariant2 x
+group by x."Contract_address",
+    x."Day"
+order by "Day"
+),
+
+invariant as (
+select p.*,
+    case when i."Invariant_k" = 1 then 0 else i."Invariant_k" end as "Invariant_k"
+from pool_reserve p
+left join _invariant3 i
+    on p."Contract_address" = i."Contract_address"
+    and p."Day" = i."Day"
+),
+
+_swapfee1 as (
+    select 
+        date_trunc('day', se.evt_block_time) as "Day",
+        -- we need to know the kind of swap: GIVEN_IN (=0) OR GIVEN_OUT (=1)
+        -- to calculate the swap fees
+        ("singleSwap" -> 'kind')::integer as kind,
+        "tokenIn",
+        "tokenOut",
+        "amountIn",
+        "amountOut",
+        -- get poolId for filtering
+        replace(replace(("singleSwap" -> 'poolId')::text, '"', ''),  '0x', '\x')::bytea as "poolId",
+        "evt_tx_hash"
+    from weighted_pools_w_id p
+    inner join balancer_v2."Vault_call_swap" sc
+        on p."poolId" = replace(replace((sc."singleSwap" -> 'poolId')::text, '"', ''),  '0x', '\x')::bytea
+    left join balancer_v2."Vault_evt_Swap" se
+        on sc."call_tx_hash" = se."evt_tx_hash"
+    where call_success = true
+),
+
+_swapfee2 as (
+    select distinct on (1, 3)
+        date_trunc('day', "evt_block_time") as "Day",
+        "evt_block_time",
+        "swapFeePercentage"/10^18 as "swapFeePercentage"
+    from balancer_v2."WeightedPool_evt_SwapFeePercentageChanged" p
+    where contract_address = '{{Weighted Pool address}}'
+    order by 1, 3, "evt_block_time" DESC
+    -- somehow if there is more than 1 changes of swapfee in a day
+    -- use the last one
+),
+
+-- down swap fee % for each day
+_swapfee3 as (
+select 
+    d."Day", 
+    "swapFeePercentage",
+    sum(case when "swapFeePercentage" is not null then 1 else 0 end) over (order by d."Day") as grp_fee
+from date_seq d
+    left join _swapfee2
+        on d."Day" = _swapfee2."Day"
+),
+
+_swapfee4 as (
+    select
+        "Day",
+        grp_fee,
+        --"swapFeePercentage" as "origSwapFeePercentage", 
+        first_value("swapFeePercentage") over (partition by grp_fee) as "swapFeePercentage"
+    from _swapfee3 s
+),
+
+_swapfee5 as (
+    select 
+        "Day",
+        case when "swapFeePercentage" is not null then "swapFeePercentage" else 0 end as "swapFeePercentage"
+    from _swapfee4
+),
+
+_swapfee6 as (
+    select
+        a."Day",
+        "tokenIn" as "Token_address",
+        case when kind = 0 then 0 else "swapFeePercentage" * "amountIn" * (1 - "swapFeePercentage") end as "feeAmount"
+    from _swapfee1 a
+        left join _swapfee4 p
+            on a."Day" = p."Day"
+    union all
+    select
+        a."Day",
+        "tokenOut" as "Token_address",
+        case when kind = 0 then "swapFeePercentage" * "amountOut" / (1 - "swapFeePercentage") else 0 end as "feeAmount"
+    from _swapfee1 a
+        left join _swapfee4 p
+            on a."Day" = p."Day"
+),
+
+_swapfee7 as (
+    select 
+        s."Day", 
+        s."Token_address", 
+        sum(s."feeAmount"/10^t.decimals) as "feeAmount"
+    from _swapfee6 s
+        left join pool_tokens_w_symbol t
+            on s."Token_address" = t."Token_address"
+    group by s."Day", s."Token_address"
+    order by s."Day", s."Token_address"
+),
+
+_swapfee8 as (
+    select 
+        s."Day", 
+        s."Token_address",
+        "feeAmount",
+        case when v.volume = 0 then 0 else "feeAmount"/abs(v.volume) end as "Swap_fee_rate",
+        case when r."Latest_reserve" = 0 then 0 else "feeAmount"/r."Latest_reserve" end as "Fees_ROI_daily"
+    from _swapfee7 s
+        left join _swap_volume1 v
+            on s."Token_address" = v."Token_address"
+            and s."Day" = v."Day"
+        left join _pool_reserve3 r
+            on s."Token_address" = r."Token_address"
+            and s."Day" = r."Day"
+        
+),
+
+_swapfee9 as (
+    select
+        "Day",
+        array_agg("Token_address") as "Token_addresses",
+        array_agg("feeAmount") as "Token_Fees",
+        array_agg("Swap_fee_rate") as "Swap_fee_rate",
+        -- TODO: need price info to aggregate Fees_ROI_daily to a single number
+        -- array_agg("Fees_ROI_daily") as "Fees_ROI_daily"
+        -- in lieu of prices, calculate the average Fees_ROI_daily
+        sum("Fees_ROI_daily")/count("Token_address") as "Fees_ROI_daily" 
+    from _swapfee8
+    group by "Day"
+),
+
+swapfee as (
+    select i.*,
+        (case when "Token_Fees" is null then '{0, 0}' else "Token_Fees" end) as "Token_Fees",
+        (case when "Swap_fee_rate" is null then '{0, 0}' else "Swap_fee_rate" end) as "Swap_fee_rate",
+        (case when "Fees_ROI_daily" is null then 0 else "Fees_ROI_daily" end) as "Fees_ROI_daily"
+    from invariant i
+    left join _swapfee9 s
+    on i."Day" = s."Day"
+),
+
+--select * from date_seq d
+
+-- Impermanent loss
+_il1_token0_reserve as (
+select distinct on (1, 2)
+    r."Contract_address",
+    r."Day",
+    r."Token_address",
+    r."Latest_reserve"
+from _pool_reserve3 r
+order by r."Contract_address", r."Day"
+),
+
+_il2_token0_reserve as (
+    select
+        r.*,
+        w.token_weight
+    from _il1_token0_reserve r
+    left join _token_weights1 w
+        on r."Contract_address" = w."Contract_address"
+        and r."Token_address" = w."Token_address"
+),
+
+-- relative price = r_0 * w_i / (r_i * w_0)
+-- r_0: reserve of token 0
+-- r_i: reserve of token i
+-- w_0: weight of token 0
+-- w_i: weight of token i
+_il3_token_rel_price as (
+select
+    ri."Contract_address",
+    ri."Day",
+    ri."Token_address",
+    wi."token_weight",
+    ri."Latest_reserve" as r_i,
+    t0."Latest_reserve" as r_0,
+    t0."Latest_reserve" * wi.token_weight / (ri."Latest_reserve" * t0.token_weight)  as rel_price
+from _pool_reserve3 ri
+left join _il2_token0_reserve t0
+    on ri."Contract_address" = t0."Contract_address"
+    and ri."Day" = t0."Day"
+left join _token_weights1 wi
+    on ri."Contract_address" = wi."Contract_address"
+    and ri."Token_address" = wi."Token_address"
+where t0."Latest_reserve" > 0
+order by "Contract_address", "Day", "Token_address"
+),
+
+_il4_price_ratio as (
+select
+    "Contract_address",
+    "Day",
+    "Token_address",
+    token_weight,
+    rel_price/lag(rel_price, 1) over (partition by "Contract_address", "Token_address" order by "Day") as delta_price
+from _il3_token_rel_price
+),
+
+_il5 as (
+select 
+    "Contract_address",
+    "Day",
+    exp(sum(log(power(delta_price, token_weight)))) pool_value,
+    sum(delta_price * token_weight) as hold_value,
+    exp(sum(log(power(delta_price, token_weight)))) / sum(delta_price * token_weight) - 1 as "Impermanent_loss_daily"
+from _il4_price_ratio
+group by "Contract_address", "Day"
+order by "Contract_address", "Day"
+)
+
+select 
+    s.*,
+    i."Impermanent_loss_daily",
+    (s."Fees_ROI_daily" + i."Impermanent_loss_daily") *  365 as "Net_apr_daily"
+from swapfee s
+left join _il5 i
+on s."Contract_address" = i."Contract_address"
+and s."Day" = i."Day"
