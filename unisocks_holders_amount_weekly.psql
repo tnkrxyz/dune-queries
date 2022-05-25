@@ -1,0 +1,44 @@
+-- https://dune.com/queries/559694
+
+--select token_address from erc20."tokens"
+--where symbol = 'SOCKS';
+
+with socks_bal_weekly as (
+    select distinct on (wallet_address, week)
+        wallet_address,
+        date_trunc('week', day) as week,
+        amount_raw/10^18 as balance
+    from erc20."view_token_balances_daily"
+    where "token_address" = '\x23b608675a2b2fb1890d3abbd85c5775c51691d5'
+        and "wallet_address" not in ('\x0000000000000000000000000000000000000000'
+                                     --'\x37c3791bea30744a88b9292f0c3b0cd3c4969d09',
+                                     --'\x22d8432cc7aa4f8712a655fc4cdfb1baec29fca9'
+                                    )
+    order by wallet_address, week, day desc
+)
+
+select
+    h.week,
+    h.holders,
+    h.socks_outstanding,
+    p.socks_pool
+from (
+    select 
+        week,
+        count(distinct(wallet_address)) as holders,
+        sum(balance) as socks_outstanding
+    from socks_bal_weekly
+    where "wallet_address" <> '\x22d8432cc7aa4f8712a655fc4cdfb1baec29fca9'
+    group by week
+    ) h
+left join (
+    select 
+        week,
+        sum(balance) as socks_pool
+    from socks_bal_weekly
+    where "wallet_address" = '\x22d8432cc7aa4f8712a655fc4cdfb1baec29fca9'
+    group by week
+    ) p
+    on h.week = p.week
+
+
