@@ -1,0 +1,97 @@
+-- https://dune.com/queries/581047
+
+with borrow_repay as (
+    select
+        date_trunc('day', "evt_block_time") as day,
+        "user",
+        "reserve" as asset,
+        'borrow' as act
+        --"borrowRate",
+        --"amount"
+    from aave_v3."Pool_evt_Borrow"
+    
+    union
+    
+    select
+        date_trunc('day', "evt_block_time") as day,
+        "user",
+        "reserve" as asset,
+        'repay' as act
+        --"amount"
+    from aave_v3."Pool_evt_Repay"
+),
+
+borrowers as (
+    select
+        b.day,
+        count(distinct("user")) as count_borrowers
+    from borrow_repay b
+    group by b.day
+),
+
+new_borrowers as (
+    select
+        day,
+        count(*) as new_borrowers
+    from (
+        select distinct on (1)
+            "user",
+            day
+        from borrow_repay
+        order by "user", day) t
+    group by day
+),
+
+tvl_add_rm as (
+    select
+        date_trunc('day', "evt_block_time") as day,
+        "user"
+        --"reserve",
+        --"amount"
+    from aave_v3."Pool_evt_Supply"
+    
+    union
+    
+    select
+        date_trunc('day', "evt_block_time") as day,
+        "user"
+        --"reserve",
+        --"amount"
+    from aave_v3."Pool_evt_Withdraw"
+),
+
+depositers as (
+    select
+        b.day,
+        count(distinct("user")) as count_depositers
+    from tvl_add_rm b
+    group by b.day
+),
+
+new_depositers as (
+    select
+        day,
+        count(*) as new_depositers
+    from (
+        select distinct on (1)
+            "user",
+            day
+        from tvl_add_rm
+        order by "user", day) t
+    group by day
+)
+
+select
+    d.day,
+    case when b.count_borrowers is null then 0 else b.count_borrowers end as count_borrowers,
+    case when nb.new_borrowers is null then 0 else nb.new_borrowers end as new_borrowers,
+    case when d.count_depositers is null then 0 else d.count_depositers end as count_depositers,
+    case when nd.new_depositers is null then 0 else nd.new_depositers end as new_depositers
+from depositers d
+    full join borrowers b
+        on d.day = b.day
+    full join new_borrowers nb
+        on d.day = nb.day
+    full join new_depositers nd
+        on d.day = nd.day
+order by d.day
